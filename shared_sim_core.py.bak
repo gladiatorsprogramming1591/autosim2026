@@ -1,0 +1,1351 @@
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Tuple
+
+import numpy as np
+
+from pathplanner_compat import is_pathplanner_payload, load_pathplanner_dict, save_pathplanner_file
+
+INCH_TO_M = 0.0254
+LB_TO_KG = 0.45359237
+
+# Published manual dimensions.
+BALL_DIAMETER_M = 5.91 * INCH_TO_M
+BALL_RADIUS_M = BALL_DIAMETER_M / 2.0
+BALL_MASS_MIN_KG = 0.448 * LB_TO_KG
+BALL_MASS_MAX_KG = 0.500 * LB_TO_KG
+
+FIELD_WIDTH_M = 317.7 * INCH_TO_M
+FIELD_LENGTH_M = 651.2 * INCH_TO_M
+
+ALLIANCE_ZONE_DEPTH_M = 158.6 * INCH_TO_M
+NEUTRAL_ZONE_DEPTH_M = 283.0 * INCH_TO_M
+OUTPOST_AREA_WIDTH_M = 71.0 * INCH_TO_M
+ALLIANCE_AREA_DEPTH_M = 134.0 * INCH_TO_M
+HUMAN_START_LINE_FROM_WALL_M = 24.0 * INCH_TO_M
+
+HUB_SIZE_M = 47.0 * INCH_TO_M
+HUB_OPENING_HEX_FLAT_M = 41.7 * INCH_TO_M
+HUB_CENTER_FROM_WALL_M = 158.6 * INCH_TO_M
+
+BUMP_WIDTH_M = 73.0 * INCH_TO_M
+BUMP_DEPTH_M = 44.4 * INCH_TO_M
+BUMP_HEIGHT_M = 6.513 * INCH_TO_M
+BUMP_RAMP_ANGLE_DEG = 15.0
+
+TRENCH_WIDTH_M = 65.65 * INCH_TO_M
+TRENCH_DEPTH_M = 47.0 * INCH_TO_M
+TRENCH_HEIGHT_M = 40.25 * INCH_TO_M
+TRENCH_CLEAR_WIDTH_M = 50.34 * INCH_TO_M
+TRENCH_CLEAR_HEIGHT_M = 22.25 * INCH_TO_M
+
+DEPOT_WIDTH_M = 42.0 * INCH_TO_M
+DEPOT_DEPTH_M = 27.0 * INCH_TO_M
+DEPOT_BARRIER_WIDTH_M = 3.0 * INCH_TO_M
+DEPOT_BARRIER_HEIGHT_M = 1.125 * INCH_TO_M
+
+TOWER_WIDTH_M = 49.25 * INCH_TO_M
+TOWER_DEPTH_M = 45.0 * INCH_TO_M
+TOWER_BASE_WIDTH_M = 39.0 * INCH_TO_M
+TOWER_BASE_DEPTH_M = 45.18 * INCH_TO_M
+
+APRILTAG_SIZE_M = 8.125 * INCH_TO_M
+APRILTAG_PANEL_M = 10.5 * INCH_TO_M
+APRILTAG_HUB_CENTER_Z_M = 44.25 * INCH_TO_M
+APRILTAG_TOWER_CENTER_Z_M = 21.75 * INCH_TO_M
+APRILTAG_OUTPOST_CENTER_Z_M = 21.75 * INCH_TO_M
+APRILTAG_TRENCH_CENTER_Z_M = 35.0 * INCH_TO_M
+
+PACK_WIDTH_M = 72.0 * INCH_TO_M
+PACK_HEIGHT_M = 206.0 * INCH_TO_M
+CENTER_GAP_M = 2.0 * INCH_TO_M
+
+BALL_STATE_FREE = "free"
+BALL_STATE_CONTACTED = "contacted"
+BALL_STATE_CONTROLLED = "controlled"
+BALL_STATE_INDEXED = "indexed"
+
+
+@dataclass
+class PathWaypoint:
+    x: float
+    y: float
+    theta_deg: float
+
+
+@dataclass
+class PathSpec:
+    name: str
+    waypoints: List[PathWaypoint]
+    max_velocity: float = 3.5
+    max_acceleration: float = 2.5
+    use_spline: bool = True
+    samples_per_seg: int = 28
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_serializable_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        return data
+
+
+@dataclass
+class FieldFeatureDims:
+    hub_size_m: float = HUB_SIZE_M
+    bump_width_m: float = BUMP_WIDTH_M
+    bump_depth_m: float = BUMP_DEPTH_M
+    trench_width_m: float = TRENCH_WIDTH_M
+    trench_depth_m: float = TRENCH_DEPTH_M
+    depot_width_m: float = DEPOT_WIDTH_M
+    depot_depth_m: float = DEPOT_DEPTH_M
+
+
+@dataclass
+class FieldPlacement:
+    # Hub location is published directly.
+    hub_x_from_alliance_wall_m: float = HUB_CENTER_FROM_WALL_M
+    hub_y_m: float = 0.0
+
+    # Bump spacing is inferred from “hub centered between two bumps” using the
+    # published top-view widths. This is intentionally explicit and easy to replace
+    # with exact drawing data from the official field drawings.
+    bump_center_y_offset_m: float = (HUB_SIZE_M + BUMP_WIDTH_M) / 2.0
+    bump_center_x_offset_m: float = 0.0
+
+    # Trench placement is the least explicit relationship in the manual text.
+    # These defaults place one trench on the scoring-table side and one on the
+    # audience side for each alliance, with the trench arm extending inward from
+    # the guardrail. Replace with official drawing values when available.
+    trench_center_y_from_midline_m: float = FIELD_WIDTH_M / 2.0 - TRENCH_DEPTH_M / 2.0
+    trench_center_x_offset_from_hub_m: float = 0.0
+
+    # There appears to be additional blocked structure between each trench and the
+    # adjacent bump / tower assembly. Model that explicitly as a rectangular hard
+    # obstacle spanning the y-gap between the trench and bump footprints.
+    trench_bump_barrier_x_offset_from_hub_m: float = 0.0
+    trench_bump_barrier_half_width_m: float = min(BUMP_DEPTH_M, TRENCH_WIDTH_M) / 2.0
+
+    # Depot placement is also isolated here because the manual gives size and wall
+    # relationship but not an easily extracted absolute in-plane coordinate in text.
+    red_depot_center_y_m: float = FIELD_WIDTH_M / 2.0 - OUTPOST_AREA_WIDTH_M / 2.0
+    blue_depot_center_y_m: float = -FIELD_WIDTH_M / 2.0 + OUTPOST_AREA_WIDTH_M / 2.0
+    depot_center_x_from_wall_m: float = DEPOT_DEPTH_M / 2.0
+
+
+@dataclass
+class SimParams:
+    physics_dt: float = 1.0 / 180.0
+    total_time_pad: float = 0.8
+    snapshot_stride: int = 5
+
+    # Collision / contact
+    ball_restitution: float = 0.60
+    wall_restitution: float = 0.24
+    robot_restitution: float = 0.12
+    tangential_damping_ball: float = 0.06
+    tangential_damping_robot: float = 0.08
+
+    # Motion losses
+    rolling_resistance_accel: float = 0.65
+    free_drag_linear: float = 0.015
+    sleep_speed: float = 0.015
+
+    # Start state
+    n_balls_target: int = 384
+    pack_jitter_fraction: float = 0.05
+    pack_fill_fraction: float = 0.985
+    relax_steps: int = 32
+    relax_strength: float = 0.68
+
+    # Robot bumper envelope
+    robot_width: float = 0.76
+    robot_length: float = 0.84
+
+    # Intake model
+    intake_enabled: bool = True
+    intake_depth: float = 0.20
+    intake_half_width: float = 0.34
+    intake_capture_speed: float = 4.0
+    intake_hold_offset: float = 0.22
+    max_intaked_balls: int = 40
+    intake_settle_time: float = 0.08
+    intake_index_time: float = 0.18
+    side_entry_rejection_factor: float = 0.55
+    max_visible_controlled: int = 3
+    intake_hold_strength: float = 28.0
+    intake_hold_damping: float = 8.0
+    intake_release_distance: float = 0.16
+    intake_release_speed: float = 3.0
+
+    # Static field elements
+    enable_hub_collision: bool = True
+    enable_trench_collision: bool = False
+    enable_depot_collision: bool = True
+    enable_bump_regions: bool = True
+    enable_trench_bump_barriers: bool = True
+
+    # Hub collision model.
+    hub_theta_deg: float = 0.0
+    hub_keepout_inflate: float = 0.00
+    hub_restitution: float = 0.18
+    hub_tangential_damping: float = 0.18
+    hub_surface_drag: float = 0.00
+    hub_outer_half_width: float = 0.52
+    hub_outer_half_height: float = 0.58
+
+    # Trench / depot collision styling.
+    trench_restitution: float = 0.12
+    trench_tangential_damping: float = 0.28
+    trench_barrier_restitution: float = 0.10
+    trench_barrier_tangential_damping: float = 0.30
+    depot_restitution: float = 0.08
+    depot_tangential_damping: float = 0.32
+
+    # Bump region effects.
+    bump_surface_drag: float = 0.22
+    bump_crest_drag: float = 0.75
+    bump_roll_accel: float = 1.10
+
+    # Analysis
+    heatmap_bins_x: int = 72
+    heatmap_bins_y: int = 36
+    random_seed_base: int = 0
+
+    # Geometry assumptions
+    placement: FieldPlacement = field(default_factory=FieldPlacement)
+    dims: FieldFeatureDims = field(default_factory=FieldFeatureDims)
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+@dataclass
+class FieldObstacle:
+    name: str
+    center: np.ndarray
+    half_extents: np.ndarray
+    theta_rad: float
+    restitution: float
+    tangential_damping: float
+    surface_drag: float = 0.0
+    min_clear_height_m: float = 0.0
+    tags: tuple[str, ...] = ()
+
+
+@dataclass
+class FieldSurfaceRegion:
+    name: str
+    center: np.ndarray
+    half_extents: np.ndarray
+    theta_rad: float
+    kind: str
+    tags: tuple[str, ...] = ()
+
+
+@dataclass
+class ReferencePoint:
+    name: str
+    pos: np.ndarray
+    tags: tuple[str, ...] = ()
+
+
+@dataclass
+class AprilTagInfo:
+    tag_id: int
+    family: str
+    center: np.ndarray  # x, y, z
+    facing_deg: float
+    mount_name: str
+
+
+@dataclass
+class Ball:
+    pos: np.ndarray
+    vel: np.ndarray
+    radius: float
+    mass: float
+    state: str = BALL_STATE_FREE
+    timer: float = 0.0
+    captured_slot: int = -1
+    capture_pos: np.ndarray | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.state == BALL_STATE_FREE
+
+    @property
+    def indexed(self) -> bool:
+        return self.state == BALL_STATE_INDEXED
+
+    @property
+    def simulated(self) -> bool:
+        return self.state != BALL_STATE_INDEXED
+
+
+@dataclass
+class GeneratedTrajectory:
+    t_samples: np.ndarray
+    xy_samples: np.ndarray
+    theta_samples_rad: np.ndarray
+    total_time: float
+    s_samples: np.ndarray
+
+
+@dataclass
+class Snapshot:
+    t: float
+    ball_positions: np.ndarray
+    active_mask: np.ndarray
+    indexed_mask: np.ndarray
+    robot_pos: np.ndarray
+    robot_theta: float
+    captured_count: int
+
+
+@dataclass
+class RunResult:
+    final_positions: np.ndarray
+    active_mask: np.ndarray
+    indexed_mask: np.ndarray
+    indexed_positions: np.ndarray
+    snapshots: List[Snapshot]
+    captured_count: int
+    path_name: str
+    seed: int
+    total_time: float
+    collision_samples: int = 0
+    bump_region_samples: int = 0
+    trench_region_samples: int = 0
+    first_intake_time: float | None = None
+    robot_trace: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    collision_trace: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    bump_trace: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    trench_trace: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    capture_trace: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    contact_trace: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    contacted_count: int = 0
+    controlled_count: int = 0
+    free_count: int = 0
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def norm(v: np.ndarray) -> float:
+    return float(np.linalg.norm(v))
+
+
+def unit(v: np.ndarray) -> np.ndarray:
+    n = norm(v)
+    if n < 1e-12:
+        return np.zeros_like(v)
+    return v / n
+
+
+def rotmat(theta: float) -> np.ndarray:
+    c, s = math.cos(theta), math.sin(theta)
+    return np.array([[c, -s], [s, c]], dtype=float)
+
+
+def shortest_angle_interp(a0: float, a1: float, alpha: float) -> float:
+    d = ((a1 - a0 + math.pi) % (2.0 * math.pi)) - math.pi
+    return a0 + alpha * d
+
+
+def point_in_obb(point: np.ndarray, center: np.ndarray, half_extents: np.ndarray, theta: float, inflate: float = 0.0) -> bool:
+    local = rotmat(theta).T @ (point - center)
+    hx, hy = half_extents + inflate
+    return abs(local[0]) <= hx + 1e-12 and abs(local[1]) <= hy + 1e-12
+
+
+def closest_point_on_obb(point: np.ndarray, center: np.ndarray, half_extents: np.ndarray, theta: float) -> np.ndarray:
+    R = rotmat(theta)
+    local = R.T @ (point - center)
+    clamped = np.array(
+        [
+            clamp(local[0], -half_extents[0], half_extents[0]),
+            clamp(local[1], -half_extents[1], half_extents[1]),
+        ],
+        dtype=float,
+    )
+    return center + R @ clamped
+
+
+def _obb_axes(theta: float) -> tuple[np.ndarray, np.ndarray]:
+    R = rotmat(theta)
+    return R[:, 0].copy(), R[:, 1].copy()
+
+
+def obb_intersects_obb(c1: np.ndarray, e1: np.ndarray, t1: float, c2: np.ndarray, e2: np.ndarray, t2: float) -> bool:
+    a0, a1 = _obb_axes(t1)
+    b0, b1 = _obb_axes(t2)
+    axes = [a0, a1, b0, b1]
+    d = c2 - c1
+    for axis in axes:
+        axis = unit(axis)
+        r1 = abs(np.dot(a0 * e1[0], axis)) + abs(np.dot(a1 * e1[1], axis))
+        r2 = abs(np.dot(b0 * e2[0], axis)) + abs(np.dot(b1 * e2[1], axis))
+        if abs(np.dot(d, axis)) > r1 + r2 + 1e-12:
+            return False
+    return True
+
+
+def robot_body_collides(robot_pos: np.ndarray, robot_theta: float, params: SimParams, obstacles: Iterable[FieldObstacle]) -> bool:
+    half = np.array([params.robot_length / 2.0, params.robot_width / 2.0], dtype=float)
+    for obs in obstacles:
+        if obb_intersects_obb(robot_pos, half, robot_theta, obs.center, obs.half_extents, obs.theta_rad):
+            return True
+    return False
+
+
+def robot_body_in_region(robot_pos: np.ndarray, robot_theta: float, params: SimParams, region: FieldSurfaceRegion) -> bool:
+    half = np.array([params.robot_length / 2.0, params.robot_width / 2.0], dtype=float)
+    return obb_intersects_obb(robot_pos, half, robot_theta, region.center, region.half_extents, region.theta_rad)
+
+
+def catmull_rom(p0, p1, p2, p3, u):
+    u2 = u * u
+    u3 = u2 * u
+    return 0.5 * ((2 * p1) + (-p0 + p2) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u2 + (-p0 + 3 * p1 - 3 * p2 + p3) * u3)
+
+
+def sample_catmull_rom(points: List[np.ndarray], samples_per_seg: int) -> List[np.ndarray]:
+    if len(points) <= 1:
+        return points[:]
+    if len(points) == 2:
+        out = []
+        p0, p1 = points
+        for i in range(samples_per_seg + 1):
+            a = i / samples_per_seg
+            out.append((1.0 - a) * p0 + a * p1)
+        return out
+
+    padded = [points[0]] + points + [points[-1]]
+    out = []
+    for i in range(1, len(padded) - 2):
+        p0, p1, p2, p3 = padded[i - 1], padded[i], padded[i + 1], padded[i + 2]
+        for j in range(samples_per_seg):
+            u = j / samples_per_seg
+            out.append(catmull_rom(p0, p1, p2, p3, u))
+    out.append(points[-1])
+    return out
+
+
+def _build_path_geometry(path: PathSpec) -> Tuple[np.ndarray, np.ndarray]:
+    pts = [np.array([wp.x, wp.y], dtype=float) for wp in path.waypoints]
+    if len(pts) == 0:
+        return np.zeros((1, 2)), np.zeros(1)
+    if len(pts) == 1:
+        return np.array([pts[0]]), np.array([math.radians(path.waypoints[0].theta_deg)])
+
+    sampled = sample_catmull_rom(pts, path.samples_per_seg) if path.use_spline else pts
+    xy = np.array(sampled, dtype=float)
+
+    wp_thetas = [math.radians(wp.theta_deg) for wp in path.waypoints]
+    wp_xy = np.array([[wp.x, wp.y] for wp in path.waypoints], dtype=float)
+    seg_len_wp = np.linalg.norm(np.diff(wp_xy, axis=0), axis=1) if len(wp_xy) > 1 else np.zeros(1)
+    s_wp = np.concatenate(([0.0], np.cumsum(seg_len_wp)))
+    seg_len = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+    s_xy = np.concatenate(([0.0], np.cumsum(seg_len)))
+    headings = np.zeros(len(xy), dtype=float)
+    for i, s in enumerate(s_xy):
+        j = int(np.searchsorted(s_wp, s, side="right") - 1)
+        j = max(0, min(j, len(wp_thetas) - 2))
+        s0, s1 = s_wp[j], s_wp[j + 1]
+        alpha = 0.0 if s1 <= s0 else (s - s0) / (s1 - s0)
+        headings[i] = shortest_angle_interp(wp_thetas[j], wp_thetas[j + 1], alpha)
+    return xy, headings
+
+
+def _time_for_distance(distance: float, vmax: float, amax: float, total_dist: float) -> float:
+    if total_dist <= 1e-12:
+        return 0.0
+    t_accel = vmax / amax
+    d_accel = 0.5 * amax * t_accel * t_accel
+    if 2.0 * d_accel >= total_dist:
+        # triangular
+        vp = math.sqrt(total_dist * amax)
+        t_accel = vp / amax
+        d_half = 0.5 * total_dist
+        if distance <= d_half:
+            return math.sqrt(2.0 * distance / amax)
+        rem = total_dist - distance
+        return 2.0 * t_accel - math.sqrt(2.0 * rem / amax)
+
+    d_cruise = total_dist - 2.0 * d_accel
+    t_cruise = d_cruise / vmax
+    if distance <= d_accel:
+        return math.sqrt(2.0 * distance / amax)
+    if distance <= d_accel + d_cruise:
+        return t_accel + (distance - d_accel) / vmax
+    rem = total_dist - distance
+    return 2.0 * t_accel + t_cruise - math.sqrt(2.0 * rem / amax)
+
+
+def generate_trajectory(path: PathSpec) -> GeneratedTrajectory:
+    xy, headings = _build_path_geometry(path)
+    if len(xy) == 1:
+        return GeneratedTrajectory(np.array([0.0], dtype=float), xy.copy(), headings.copy(), 0.0, np.array([0.0], dtype=float))
+
+    seg_len = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+    s_samples = np.concatenate(([0.0], np.cumsum(seg_len)))
+    total_dist = float(s_samples[-1])
+    if total_dist < 1e-9:
+        t_samples = np.linspace(0.0, 1e-3, len(xy))
+        return GeneratedTrajectory(t_samples=t_samples, xy_samples=xy, theta_samples_rad=headings, total_time=float(t_samples[-1]), s_samples=s_samples)
+
+    vmax = max(1e-3, path.max_velocity)
+    amax = max(1e-3, path.max_acceleration)
+    total_time = _time_for_distance(total_dist, vmax, amax, total_dist)
+    t_samples = np.array([_time_for_distance(s, vmax, amax, total_dist) for s in s_samples], dtype=float)
+    return GeneratedTrajectory(t_samples=t_samples, xy_samples=xy, theta_samples_rad=headings, total_time=float(total_time), s_samples=s_samples)
+
+
+def robot_pose_from_trajectory(traj: GeneratedTrajectory, t: float) -> Tuple[np.ndarray, float, np.ndarray]:
+    if len(traj.t_samples) == 1:
+        return traj.xy_samples[0].copy(), float(traj.theta_samples_rad[0]), np.zeros(2, dtype=float)
+
+    t = clamp(float(t), float(traj.t_samples[0]), float(traj.t_samples[-1]))
+    i = int(np.searchsorted(traj.t_samples, t, side="right") - 1)
+    i = max(0, min(i, len(traj.t_samples) - 2))
+    t0, t1 = traj.t_samples[i], traj.t_samples[i + 1]
+    alpha = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+
+    p0, p1 = traj.xy_samples[i], traj.xy_samples[i + 1]
+    pos = (1.0 - alpha) * p0 + alpha * p1
+    theta = shortest_angle_interp(float(traj.theta_samples_rad[i]), float(traj.theta_samples_rad[i + 1]), alpha)
+    dt = max(1e-9, t1 - t0)
+    vel = (p1 - p0) / dt
+    return pos.astype(float), float(theta), vel.astype(float)
+
+
+def generate_jittered_hex_pack(
+    rng: np.random.Generator,
+    center: Tuple[float, float],
+    width: float,
+    height: float,
+    radius: float,
+    fill_fraction: float,
+    jitter_fraction: float,
+    masses: np.ndarray,
+    center_gap: float = 0.0,
+) -> List[Ball]:
+    cx, cy = center
+    x0, x1 = cx - width / 2.0, cx + width / 2.0
+    y0, y1 = cy - height / 2.0, cy + height / 2.0
+    dx = 2.0 * radius
+    dy = math.sqrt(3.0) * radius
+
+    balls: List[Ball] = []
+    row = 0
+    yi = y0 + radius
+    mass_index = 0
+    while yi <= y1 - radius + 1e-12:
+        x_start = x0 + radius + (radius if row % 2 else 0.0)
+        xi = x_start
+        while xi <= x1 - radius + 1e-12:
+            if abs(xi - cx) < 0.5 * center_gap:
+                xi += dx
+                continue
+            if rng.random() <= fill_fraction:
+                jitter = jitter_fraction * radius
+                px = clamp(xi + rng.uniform(-jitter, jitter), x0 + radius, x1 - radius)
+                py = clamp(yi + rng.uniform(-jitter, jitter), y0 + radius, y1 - radius)
+                balls.append(Ball(np.array([px, py], dtype=float), np.zeros(2, dtype=float), radius, float(masses[mass_index % len(masses)])))
+                mass_index += 1
+            xi += dx
+        yi += dy
+        row += 1
+    return balls
+
+
+def relax_pack(balls: List[Ball], center, width, height, steps, strength) -> None:
+    cx, cy = center
+    xmin, xmax = cx - width / 2.0, cx + width / 2.0
+    ymin, ymax = cy - height / 2.0, cy + height / 2.0
+    for _ in range(steps):
+        moved = False
+        for i in range(len(balls)):
+            bi = balls[i]
+            for j in range(i + 1, len(balls)):
+                bj = balls[j]
+                d = bj.pos - bi.pos
+                dist = norm(d)
+                target = bi.radius + bj.radius
+                if dist < 1e-12:
+                    d = np.array([1e-6, 0.0], dtype=float)
+                    dist = norm(d)
+                if dist < target:
+                    n = d / dist
+                    overlap = target - dist
+                    shift = 0.5 * strength * overlap * n
+                    bi.pos -= shift
+                    bj.pos += shift
+                    moved = True
+        for b in balls:
+            if not b.simulated:
+                continue
+            b.pos[0] = clamp(b.pos[0], xmin + b.radius, xmax - b.radius)
+            b.pos[1] = clamp(b.pos[1], ymin + b.radius, ymax - b.radius)
+        if not moved:
+            break
+
+
+def make_initial_balls(params: SimParams, seed: int) -> List[Ball]:
+    rng = np.random.default_rng(seed)
+    masses = rng.uniform(BALL_MASS_MIN_KG, BALL_MASS_MAX_KG, size=max(params.n_balls_target * 2, 600))
+    balls = generate_jittered_hex_pack(
+        rng,
+        (0.0, 0.0),
+        PACK_WIDTH_M,
+        PACK_HEIGHT_M,
+        BALL_RADIUS_M,
+        params.pack_fill_fraction,
+        params.pack_jitter_fraction,
+        masses,
+        CENTER_GAP_M,
+    )
+    if len(balls) > params.n_balls_target:
+        rng.shuffle(balls)
+        balls = balls[: params.n_balls_target]
+    relax_pack(balls, (0.0, 0.0), PACK_WIDTH_M, PACK_HEIGHT_M, params.relax_steps, params.relax_strength)
+    return balls
+
+
+def alliance_hub_centers(params: SimParams) -> dict[str, np.ndarray]:
+    xmin, xmax = -FIELD_LENGTH_M / 2.0, FIELD_LENGTH_M / 2.0
+    placement = params.placement
+    return {
+        "red": np.array([xmin + placement.hub_x_from_alliance_wall_m, placement.hub_y_m], dtype=float),
+        "blue": np.array([xmax - placement.hub_x_from_alliance_wall_m, placement.hub_y_m], dtype=float),
+    }
+
+
+def build_field_obstacles(params: SimParams) -> List[FieldObstacle]:
+    centers = alliance_hub_centers(params)
+    placement = params.placement
+    dims = params.dims
+    obstacles: List[FieldObstacle] = []
+    theta_hub = math.radians(params.hub_theta_deg)
+
+    trench_records: List[tuple[str, str, np.ndarray, np.ndarray]] = []
+    trench_half = np.array([dims.trench_width_m / 2.0, dims.trench_depth_m / 2.0], dtype=float)
+    if params.enable_hub_collision:
+        inner_half = np.array([HUB_SIZE_M / 2.0 + params.hub_keepout_inflate, HUB_SIZE_M / 2.0 + params.hub_keepout_inflate], dtype=float)
+        outer_half = np.array([params.hub_outer_half_width + params.hub_keepout_inflate, params.hub_outer_half_height + params.hub_keepout_inflate], dtype=float)
+        for alliance, center in centers.items():
+            obstacles.append(FieldObstacle(f"{alliance}_hub_inner", center.copy(), inner_half.copy(), theta_hub, params.hub_restitution, params.hub_tangential_damping, params.hub_surface_drag, tags=("hub", alliance)))
+            obstacles.append(FieldObstacle(f"{alliance}_hub_outer", center.copy(), outer_half.copy(), theta_hub, params.hub_restitution, params.hub_tangential_damping, params.hub_surface_drag, tags=("hub", alliance, "outer")))
+
+
+
+    for alliance, center in centers.items():
+        x = center[0] + placement.trench_center_x_offset_from_hub_m
+        for side_name, sign in (("top", 1.0), ("bottom", -1.0)):
+            y = sign * placement.trench_center_y_from_midline_m
+            trench_center = np.array([x, y], dtype=float)
+
+            trench_records.append((alliance, side_name, center.copy(), trench_center.copy()))
+
+            if params.enable_trench_collision:
+                obstacles.append(
+                    FieldObstacle(
+                        f"{alliance}_trench_{side_name}",
+                        trench_center,
+                        trench_half.copy(),
+                        0.0,
+                        params.trench_restitution,
+                        params.trench_tangential_damping,
+                        0.0,
+                        min_clear_height_m=TRENCH_CLEAR_HEIGHT_M,
+                        tags=("trench", alliance, side_name),
+                    )
+                )
+
+    if params.enable_trench_bump_barriers and params.enable_trench_collision:
+        bump_half = np.array([dims.bump_depth_m / 2.0, dims.bump_width_m / 2.0], dtype=float)
+        barrier_half_x = max(0.05, placement.trench_bump_barrier_half_width_m)
+        for alliance, side_name, hub_center, trench_center in trench_records:
+            sign = 1.0 if side_name == "top" else -1.0
+            bump_center = hub_center + np.array([placement.bump_center_x_offset_m, sign * placement.bump_center_y_offset_m], dtype=float)
+            barrier_x = hub_center[0] + placement.trench_bump_barrier_x_offset_from_hub_m
+            if sign > 0.0:
+                bump_edge = bump_center[1] + bump_half[1]
+                trench_edge = trench_center[1] - trench_half[1]
+            else:
+                bump_edge = bump_center[1] - bump_half[1]
+                trench_edge = trench_center[1] + trench_half[1]
+            y0, y1 = sorted((bump_edge, trench_edge))
+            gap = y1 - y0
+            if gap <= 1e-6:
+                continue
+            obstacles.append(
+                FieldObstacle(
+                    f"{alliance}_trench_bump_barrier_{side_name}",
+                    np.array([barrier_x, 0.5 * (y0 + y1)], dtype=float),
+                    np.array([barrier_half_x, gap / 2.0], dtype=float),
+                    0.0,
+                    params.trench_barrier_restitution,
+                    params.trench_barrier_tangential_damping,
+                    0.0,
+                    tags=("trench_barrier", alliance, side_name),
+                )
+            )
+
+    if params.enable_depot_collision:
+        xmin, xmax = -FIELD_LENGTH_M / 2.0, FIELD_LENGTH_M / 2.0
+        depot_half = np.array([dims.depot_depth_m / 2.0, dims.depot_width_m / 2.0], dtype=float)
+        obstacles.append(
+            FieldObstacle(
+                "red_depot",
+                np.array([xmin + placement.depot_center_x_from_wall_m, placement.red_depot_center_y_m], dtype=float),
+                depot_half.copy(),
+                0.0,
+                params.depot_restitution,
+                params.depot_tangential_damping,
+                0.0,
+                tags=("depot", "red"),
+            )
+        )
+        obstacles.append(
+            FieldObstacle(
+                "blue_depot",
+                np.array([xmax - placement.depot_center_x_from_wall_m, placement.blue_depot_center_y_m], dtype=float),
+                depot_half.copy(),
+                0.0,
+                params.depot_restitution,
+                params.depot_tangential_damping,
+                0.0,
+                tags=("depot", "blue"),
+            )
+        )
+
+    return obstacles
+
+
+def build_field_surface_regions(params: SimParams) -> List[FieldSurfaceRegion]:
+    if not params.enable_bump_regions:
+        return []
+    centers = alliance_hub_centers(params)
+    placement = params.placement
+    dims = params.dims
+    bump_half = np.array([dims.bump_depth_m / 2.0, dims.bump_width_m / 2.0], dtype=float)
+    regions: List[FieldSurfaceRegion] = []
+    for alliance, center in centers.items():
+        for side_name, sign in (("upper", 1.0), ("lower", -1.0)):
+            c = center + np.array([placement.bump_center_x_offset_m, sign * placement.bump_center_y_offset_m], dtype=float)
+            regions.append(FieldSurfaceRegion(f"{alliance}_bump_{side_name}", c, bump_half.copy(), 0.0, kind="bump", tags=("bump", alliance, side_name)))
+    return regions
+
+
+def build_field_reference_points(params: SimParams) -> List[ReferencePoint]:
+    centers = alliance_hub_centers(params)
+    refs: List[ReferencePoint] = []
+    for alliance, center in centers.items():
+        refs.append(ReferencePoint(f"{alliance}_hub_center", center.copy(), tags=("hub", alliance)))
+    for reg in build_field_surface_regions(params):
+        refs.append(ReferencePoint(f"{reg.name}_center", reg.center.copy(), tags=reg.tags))
+    for obs in build_field_obstacles(params):
+        if any(tag in obs.tags for tag in ("trench", "trench_barrier", "depot")):
+            refs.append(ReferencePoint(f"{obs.name}_center", obs.center.copy(), tags=obs.tags))
+    xmin, xmax = -FIELD_LENGTH_M / 2.0, FIELD_LENGTH_M / 2.0
+    refs.append(ReferencePoint("red_robot_start_line_anchor", np.array([xmin + ALLIANCE_ZONE_DEPTH_M, 0.0], dtype=float), tags=("start_line", "red")))
+    refs.append(ReferencePoint("blue_robot_start_line_anchor", np.array([xmax - ALLIANCE_ZONE_DEPTH_M, 0.0], dtype=float), tags=("start_line", "blue")))
+    return refs
+
+
+def build_apriltag_metadata(params: SimParams) -> List[AprilTagInfo]:
+    centers = alliance_hub_centers(params)
+    tags: List[AprilTagInfo] = []
+
+    # Manual-supported metadata: family 36h11, IDs 1-32, locations by structure type,
+    # and mounting heights. Exact in-plane offsets beyond these relationships belong in
+    # the official field drawings, so the remaining horizontal offsets are intentionally
+    # explicit and simple here.
+    family = "36h11"
+    hub_ids = [2, 3, 4, 5, 8, 9, 10, 11, 18, 19, 20, 21, 24, 25, 26, 27]
+    hub_face_offsets = [(-HUB_SIZE_M / 2.0, 180.0), (HUB_SIZE_M / 2.0, 0.0), (0.0, 90.0), (0.0, -90.0)]
+    hidx = 0
+    for alliance, center in centers.items():
+        for face_axis, facing in hub_face_offsets:
+            if facing in (0.0, 180.0):
+                base = np.array([center[0] + face_axis, center[1], APRILTAG_HUB_CENTER_Z_M], dtype=float)
+                offsets = [np.array([0.0, 0.18, 0.0]), np.array([0.0, -0.18, 0.0])]
+            else:
+                base = np.array([center[0], center[1] + face_axis, APRILTAG_HUB_CENTER_Z_M], dtype=float)
+                offsets = [np.array([0.18, 0.0, 0.0]), np.array([-0.18, 0.0, 0.0])]
+            for off in offsets:
+                tags.append(AprilTagInfo(hub_ids[hidx], family, base + off, facing, f"{alliance}_hub"))
+                hidx += 1
+
+    # TOWER WALL: IDs 15,16,31,32.
+    xmin, xmax = -FIELD_LENGTH_M / 2.0, FIELD_LENGTH_M / 2.0
+    tower_x = {"red": xmin + 0.35, "blue": xmax - 0.35}
+    for ids, alliance, facing in (([15, 16], "red", 180.0), ([31, 32], "blue", 0.0)):
+        for i, dy in enumerate((0.0, 0.23)):
+            tags.append(AprilTagInfo(ids[i], family, np.array([tower_x[alliance], dy, APRILTAG_TOWER_CENTER_Z_M], dtype=float), facing, f"{alliance}_tower_wall"))
+
+    # OUTPOST: IDs 13,14,29,30.
+    outpost_y = {"red": FIELD_WIDTH_M / 2.0 - OUTPOST_AREA_WIDTH_M / 2.0, "blue": -FIELD_WIDTH_M / 2.0 + OUTPOST_AREA_WIDTH_M / 2.0}
+    outpost_x = {"red": xmin + 0.55, "blue": xmax - 0.55}
+    for ids, alliance, facing in (([13, 14], "red", 180.0), ([29, 30], "blue", 0.0)):
+        for i, dx in enumerate((0.0, 0.23)):
+            tags.append(AprilTagInfo(ids[i], family, np.array([outpost_x[alliance] + (dx if alliance == "red" else -dx), outpost_y[alliance], APRILTAG_OUTPOST_CENTER_Z_M], dtype=float), facing, f"{alliance}_outpost"))
+
+    trench_ids = [1, 6, 7, 12, 17, 22, 23, 28]
+    tidx = 0
+    for obs in build_field_obstacles(params):
+        if "trench" not in obs.tags:
+            continue
+        for facing in (90.0, -90.0):
+            tags.append(AprilTagInfo(trench_ids[tidx], family, np.array([obs.center[0], obs.center[1], APRILTAG_TRENCH_CENTER_Z_M], dtype=float), facing, obs.name))
+            tidx += 1
+    return tags
+
+
+def apply_motion_losses(ball: Ball, dt: float, params: SimParams) -> None:
+    speed = norm(ball.vel)
+    if speed < 1e-12:
+        return
+    drag_accel = params.free_drag_linear * speed
+    total_accel = drag_accel + params.rolling_resistance_accel
+    dv = total_accel * dt
+    if dv >= speed:
+        ball.vel[:] = 0.0
+    else:
+        ball.vel[:] = ball.vel - dv * unit(ball.vel)
+    if norm(ball.vel) < params.sleep_speed:
+        ball.vel[:] = 0.0
+
+
+def resolve_ball_wall(ball: Ball, xmin, xmax, ymin, ymax, params: SimParams) -> None:
+    if not ball.simulated:
+        return
+    if ball.pos[0] - ball.radius < xmin:
+        ball.pos[0] = xmin + ball.radius
+        if ball.vel[0] < 0.0:
+            ball.vel[0] *= -params.wall_restitution
+            ball.vel[1] *= (1.0 - params.tangential_damping_ball)
+    if ball.pos[0] + ball.radius > xmax:
+        ball.pos[0] = xmax - ball.radius
+        if ball.vel[0] > 0.0:
+            ball.vel[0] *= -params.wall_restitution
+            ball.vel[1] *= (1.0 - params.tangential_damping_ball)
+    if ball.pos[1] - ball.radius < ymin:
+        ball.pos[1] = ymin + ball.radius
+        if ball.vel[1] < 0.0:
+            ball.vel[1] *= -params.wall_restitution
+            ball.vel[0] *= (1.0 - params.tangential_damping_ball)
+    if ball.pos[1] + ball.radius > ymax:
+        ball.pos[1] = ymax - ball.radius
+        if ball.vel[1] > 0.0:
+            ball.vel[1] *= -params.wall_restitution
+            ball.vel[0] *= (1.0 - params.tangential_damping_ball)
+
+
+def resolve_ball_ball(b1: Ball, b2: Ball, params: SimParams) -> None:
+    if not (b1.simulated and b2.simulated):
+        return
+    d = b2.pos - b1.pos
+    dist = norm(d)
+    min_dist = b1.radius + b2.radius
+    if dist < 1e-12:
+        d = np.array([1e-6, 0.0], dtype=float)
+        dist = norm(d)
+    if dist >= min_dist:
+        return
+
+    n = d / dist
+    t_hat = np.array([-n[1], n[0]], dtype=float)
+    overlap = min_dist - dist
+
+    inv1, inv2 = 1.0 / b1.mass, 1.0 / b2.mass
+    inv_total = inv1 + inv2
+    correction = overlap / inv_total
+    b1.pos -= 0.5 * correction * inv1 * n
+    b2.pos += 0.5 * correction * inv2 * n
+
+    rel_vel = b2.vel - b1.vel
+    vn = float(np.dot(rel_vel, n))
+    vt = float(np.dot(rel_vel, t_hat))
+    if vn < 0.0:
+        jn = -(1.0 + params.ball_restitution) * vn / inv_total
+        jt = -params.tangential_damping_ball * vt / inv_total
+        impulse = jn * n + jt * t_hat
+        b1.vel -= impulse / b1.mass
+        b2.vel += impulse / b2.mass
+
+
+def intake_local_coordinates(ball_pos: np.ndarray, robot_pos: np.ndarray, robot_theta: float, params: SimParams) -> np.ndarray:
+    R = rotmat(robot_theta)
+    return R.T @ (ball_pos - robot_pos)
+
+
+
+def try_intake_contact(ball: Ball, robot_pos, robot_theta, robot_vel, params: SimParams, occupied_slots: int) -> bool:
+    if not (params.intake_enabled and ball.state == BALL_STATE_FREE):
+        return False
+    if occupied_slots >= params.max_intaked_balls:
+        return False
+
+    local = intake_local_coordinates(ball.pos, robot_pos, robot_theta, params)
+    front_x = params.robot_length / 2.0
+    in_front = front_x <= local[0] <= front_x + params.intake_depth
+    centered = abs(local[1]) <= params.intake_half_width
+    if not (in_front and centered):
+        return False
+
+    R = rotmat(robot_theta)
+    front_normal = R @ np.array([1.0, 0.0], dtype=float)
+    side_normal = R @ np.array([0.0, 1.0], dtype=float)
+    rel_vel = ball.vel - robot_vel
+    rel_normal_speed = abs(float(np.dot(rel_vel, front_normal)))
+    side_speed = abs(float(np.dot(rel_vel, side_normal)))
+    side_allowance = params.intake_capture_speed * (1.0 - params.side_entry_rejection_factor)
+    if rel_normal_speed > params.intake_capture_speed or side_speed > params.intake_capture_speed + side_allowance:
+        return False
+
+    ball.capture_pos = ball.pos.copy()
+    ball.captured_slot = occupied_slots
+    if params.intake_settle_time <= 0.0:
+        if params.intake_index_time <= 0.0:
+            ball.state = BALL_STATE_INDEXED
+            ball.timer = 0.0
+            ball.vel[:] = 0.0
+        else:
+            ball.state = BALL_STATE_CONTROLLED
+            ball.timer = params.intake_index_time
+    else:
+        ball.state = BALL_STATE_CONTACTED
+        ball.timer = params.intake_settle_time
+    return True
+
+
+def carried_ball_pose(robot_pos: np.ndarray, robot_theta: float, params: SimParams, slot_idx: int) -> np.ndarray:
+    front_x = params.robot_length / 2.0 - params.intake_hold_offset - 0.07 * slot_idx
+    lateral = 0.0
+    if slot_idx > 0:
+        lateral = 0.08 * ((slot_idx + 1) // 2) * (1.0 if slot_idx % 2 else -1.0)
+    local = np.array([front_x, lateral], dtype=float)
+    return robot_pos + rotmat(robot_theta) @ local
+
+
+def carried_ball_pose(robot_pos: np.ndarray, robot_theta: float, params: SimParams, slot_idx: int) -> np.ndarray:
+    front_x = params.robot_length / 2.0 - params.intake_hold_offset - 0.07 * slot_idx
+    lateral = 0.0
+    if slot_idx > 0:
+        lateral = 0.08 * ((slot_idx + 1) // 2) * (1.0 if slot_idx % 2 else -1.0)
+    local = np.array([front_x, lateral], dtype=float)
+    return robot_pos + rotmat(robot_theta) @ local
+
+
+def update_controlled_ball(ball: Ball, robot_pos, robot_theta, robot_vel, params: SimParams, dt: float) -> bool:
+    if ball.state not in (BALL_STATE_CONTACTED, BALL_STATE_CONTROLLED):
+        return False
+
+    slot = max(0, ball.captured_slot)
+    target = carried_ball_pose(robot_pos, robot_theta, params, slot)
+
+    rel_vel = ball.vel - robot_vel
+    to_target = target - ball.pos
+    ball.vel += params.intake_hold_strength * to_target * dt
+    ball.vel -= params.intake_hold_damping * rel_vel * dt
+
+    local = intake_local_coordinates(ball.pos, robot_pos, robot_theta, params)
+    front_x = params.robot_length / 2.0
+    retained = (
+        (front_x - params.intake_release_distance) <= local[0] <= (front_x + params.intake_depth + params.intake_release_distance)
+        and abs(local[1]) <= (params.intake_half_width + params.intake_release_distance)
+        and norm(rel_vel) <= params.intake_release_speed
+    )
+    if not retained:
+        ball.state = BALL_STATE_FREE
+        ball.timer = 0.0
+        ball.captured_slot = -1
+        ball.capture_pos = None
+        return False
+
+    ball.timer -= dt
+    if ball.state == BALL_STATE_CONTACTED and ball.timer <= 0.0:
+        ball.state = BALL_STATE_CONTROLLED
+        ball.timer = params.intake_index_time
+    elif ball.state == BALL_STATE_CONTROLLED and ball.timer <= 0.0:
+        ball.state = BALL_STATE_INDEXED
+        ball.timer = 0.0
+        ball.capture_pos = ball.pos.copy()
+        ball.vel[:] = 0.0
+        return True
+    return False
+
+
+def resolve_ball_robot(ball: Ball, robot_pos, robot_theta, robot_vel, params: SimParams) -> None:
+    if not ball.active:
+        return
+    half = np.array([params.robot_length / 2.0, params.robot_width / 2.0], dtype=float)
+    closest = closest_point_on_obb(ball.pos, robot_pos, half, robot_theta)
+    d = ball.pos - closest
+    dist = norm(d)
+    if dist < 1e-12:
+        d = ball.pos - robot_pos
+        if norm(d) < 1e-12:
+            d = np.array([1.0, 0.0], dtype=float)
+        dist = norm(d)
+    if dist >= ball.radius:
+        return
+
+    n = d / dist
+    t_hat = np.array([-n[1], n[0]], dtype=float)
+    overlap = ball.radius - dist
+    ball.pos += overlap * n
+
+    rel_vel = ball.vel - robot_vel
+    vn = float(np.dot(rel_vel, n))
+    vt = float(np.dot(rel_vel, t_hat))
+    if vn < 0.0:
+        new_vn = -params.robot_restitution * vn
+        ball.vel += (new_vn - vn) * n
+        ball.vel += (-params.tangential_damping_robot * vt) * t_hat
+
+
+def resolve_ball_static_obstacle(ball: Ball, obstacle: FieldObstacle, dt: float) -> None:
+    if not ball.simulated:
+        return
+
+    R = rotmat(obstacle.theta_rad)
+    local = R.T @ (ball.pos - obstacle.center)
+    hx, hy = obstacle.half_extents
+    clamped = np.array([clamp(local[0], -hx, hx), clamp(local[1], -hy, hy)], dtype=float)
+    delta_local = local - clamped
+    dist = norm(delta_local)
+
+    if dist > 1e-12:
+        if dist >= ball.radius:
+            return
+        n_local = delta_local / dist
+        penetration = ball.radius - dist
+    else:
+        dx_face = hx - abs(local[0])
+        dy_face = hy - abs(local[1])
+        if dx_face < dy_face:
+            sx = 1.0 if local[0] >= 0.0 else -1.0
+            n_local = np.array([sx, 0.0], dtype=float)
+            penetration = ball.radius + dx_face
+        else:
+            sy = 1.0 if local[1] >= 0.0 else -1.0
+            n_local = np.array([0.0, sy], dtype=float)
+            penetration = ball.radius + dy_face
+
+    n_world = R @ n_local
+    t_world = np.array([-n_world[1], n_world[0]], dtype=float)
+    ball.pos += penetration * n_world
+
+    vn = float(np.dot(ball.vel, n_world))
+    vt = float(np.dot(ball.vel, t_world))
+    if vn < 0.0:
+        new_vn = -obstacle.restitution * vn
+        new_vt = (1.0 - obstacle.tangential_damping) * vt
+        ball.vel += (new_vn - vn) * n_world + (new_vt - vt) * t_world
+    else:
+        ball.vel += (-obstacle.tangential_damping * vt) * t_world
+
+    if obstacle.surface_drag > 0.0:
+        speed = norm(ball.vel)
+        if speed > 1e-12:
+            dv = obstacle.surface_drag * dt
+            if dv >= speed:
+                ball.vel[:] = 0.0
+            else:
+                ball.vel[:] -= dv * unit(ball.vel)
+
+
+def resolve_ball_field_obstacles(ball: Ball, obstacles: Iterable[FieldObstacle], dt: float) -> None:
+    for obs in obstacles:
+        resolve_ball_static_obstacle(ball, obs, dt)
+
+
+def apply_surface_regions(ball: Ball, regions: Iterable[FieldSurfaceRegion], params: SimParams, dt: float) -> None:
+    if not ball.simulated:
+        return
+    for region in regions:
+        if not point_in_obb(ball.pos, region.center, region.half_extents, region.theta_rad):
+            continue
+        local = rotmat(region.theta_rad).T @ (ball.pos - region.center)
+        # In the real field the bump is a ridge in side view. We approximate this with
+        # an outward acceleration away from the crest and extra drag near the crest.
+        crest_alpha = max(0.0, 1.0 - abs(local[0]) / max(1e-9, region.half_extents[0]))
+        sign_x = 1.0 if local[0] >= 0.0 else -1.0
+        accel_local = np.array([params.bump_roll_accel * sign_x * crest_alpha, 0.0], dtype=float)
+        ball.vel += rotmat(region.theta_rad) @ accel_local * dt
+        speed = norm(ball.vel)
+        if speed > 1e-12:
+            dv = (params.bump_surface_drag + params.bump_crest_drag * crest_alpha) * dt
+            ball.vel[:] = np.zeros(2, dtype=float) if dv >= speed else ball.vel - dv * unit(ball.vel)
+
+
+def build_spatial_hash(balls: List[Ball], cell_size: float) -> Dict[Tuple[int, int], List[int]]:
+    grid: Dict[Tuple[int, int], List[int]] = {}
+    for i, b in enumerate(balls):
+        if not b.simulated:
+            continue
+        cx = int(math.floor(b.pos[0] / cell_size))
+        cy = int(math.floor(b.pos[1] / cell_size))
+        grid.setdefault((cx, cy), []).append(i)
+    return grid
+
+
+def neighbor_cells(cx: int, cy: int):
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            yield (cx + dx, cy + dy)
+
+
+def path_diagnostics(path: PathSpec, params: SimParams, dense_factor: int = 3) -> dict[str, np.ndarray | int | float | None]:
+    traj = generate_trajectory(path)
+    obstacles = build_field_obstacles(params)
+    regions = build_field_surface_regions(params)
+    samples: List[np.ndarray] = []
+    collision_pts: List[np.ndarray] = []
+    bump_pts: List[np.ndarray] = []
+    trench_pts: List[np.ndarray] = []
+
+    if traj.total_time <= 1e-9:
+        times = np.array([0.0], dtype=float)
+    else:
+        n = max(2, dense_factor * len(traj.xy_samples))
+        times = np.linspace(0.0, traj.total_time, n)
+
+    for t in times:
+        pos, theta, _ = robot_pose_from_trajectory(traj, float(t))
+        samples.append(pos.copy())
+        if robot_body_collides(pos, theta, params, obstacles):
+            collision_pts.append(pos.copy())
+        for region in regions:
+            if robot_body_in_region(pos, theta, params, region):
+                bump_pts.append(pos.copy())
+        for obs in obstacles:
+            if "trench" in obs.tags and obb_intersects_obb(pos, np.array([params.robot_length / 2.0, params.robot_width / 2.0]), theta, obs.center, obs.half_extents, obs.theta_rad):
+                trench_pts.append(pos.copy())
+    return {
+        "robot_trace": np.array(samples, dtype=float) if samples else np.empty((0, 2), dtype=float),
+        "collision_trace": np.array(collision_pts, dtype=float) if collision_pts else np.empty((0, 2), dtype=float),
+        "bump_trace": np.array(bump_pts, dtype=float) if bump_pts else np.empty((0, 2), dtype=float),
+        "trench_trace": np.array(trench_pts, dtype=float) if trench_pts else np.empty((0, 2), dtype=float),
+        "collision_samples": len(collision_pts),
+        "bump_region_samples": len(bump_pts),
+        "trench_region_samples": len(trench_pts),
+    }
+
+
+
+def simulate_path(path: PathSpec, params: SimParams, seed: int, collect_snapshots: bool = False) -> RunResult:
+    xmin, xmax = -FIELD_LENGTH_M / 2.0, FIELD_LENGTH_M / 2.0
+    ymin, ymax = -FIELD_WIDTH_M / 2.0, FIELD_WIDTH_M / 2.0
+
+    balls = make_initial_balls(params, seed)
+    traj = generate_trajectory(path)
+    total_time = traj.total_time + params.total_time_pad
+    n_steps = int(total_time / params.physics_dt)
+    snapshots: List[Snapshot] = []
+    cell_size = 2.5 * BALL_DIAMETER_M
+    indexed_count = 0
+    field_obstacles = build_field_obstacles(params)
+    surface_regions = build_field_surface_regions(params)
+
+    robot_trace: List[np.ndarray] = []
+    collision_trace: List[np.ndarray] = []
+    bump_trace: List[np.ndarray] = []
+    trench_trace: List[np.ndarray] = []
+    capture_trace: List[np.ndarray] = []
+    contact_trace: List[np.ndarray] = []
+    first_intake_time: float | None = None
+
+    for step in range(n_steps + 1):
+        t = step * params.physics_dt
+        drive_t = min(t, traj.total_time)
+        robot_pos, robot_theta, robot_vel = robot_pose_from_trajectory(traj, drive_t)
+        robot_trace.append(robot_pos.copy())
+
+        for b in balls:
+            if b.active:
+                b.pos += b.vel * params.physics_dt
+
+        occupied_slots = sum(b.state in (BALL_STATE_CONTACTED, BALL_STATE_CONTROLLED, BALL_STATE_INDEXED) for b in balls)
+        if params.intake_enabled:
+            for b in balls:
+                if try_intake_contact(b, robot_pos, robot_theta, robot_vel, params, occupied_slots):
+                    occupied_slots += 1
+                    contact_trace.append(robot_pos.copy())
+                    if b.state == BALL_STATE_INDEXED:
+                        indexed_count += 1
+                        capture_trace.append(robot_pos.copy())
+                    else:
+                        b.pos[:] = carried_ball_pose(robot_pos, robot_theta, params, b.captured_slot)
+                    if first_intake_time is None:
+                        first_intake_time = t
+
+        for b in balls:
+            if update_controlled_ball(b, robot_pos, robot_theta, robot_vel, params, params.physics_dt):
+                indexed_count += 1
+                capture_trace.append(robot_pos.copy())
+
+        for b in balls:
+            if not b.simulated:
+                continue
+            resolve_ball_robot(b, robot_pos, robot_theta, robot_vel, params)
+            resolve_ball_field_obstacles(b, field_obstacles, params.physics_dt)
+            apply_surface_regions(b, surface_regions, params, params.physics_dt)
+
+        grid = build_spatial_hash(balls, cell_size)
+        checked = set()
+        for (cx, cy), idxs in grid.items():
+            nearby = []
+            for nc in neighbor_cells(cx, cy):
+                nearby.extend(grid.get(nc, []))
+            for i in idxs:
+                for j in nearby:
+                    if j <= i:
+                        continue
+                    key = (i, j)
+                    if key in checked:
+                        continue
+                    checked.add(key)
+                    resolve_ball_ball(balls[i], balls[j], params)
+
+        for b in balls:
+            if b.simulated:
+                resolve_ball_wall(b, xmin, xmax, ymin, ymax, params)
+                apply_motion_losses(b, params.physics_dt, params)
+
+        robot_collision_now = robot_body_collides(robot_pos, robot_theta, params, field_obstacles)
+        if robot_collision_now:
+            collision_trace.append(robot_pos.copy())
+        for reg in surface_regions:
+            if robot_body_in_region(robot_pos, robot_theta, params, reg):
+                bump_trace.append(robot_pos.copy())
+        for obs in field_obstacles:
+            if "trench" in obs.tags and obb_intersects_obb(robot_pos, np.array([params.robot_length / 2.0, params.robot_width / 2.0]), robot_theta, obs.center, obs.half_extents, obs.theta_rad):
+                trench_trace.append(robot_pos.copy())
+
+        if collect_snapshots and step % params.snapshot_stride == 0:
+            snapshots.append(
+                Snapshot(
+                    t=t,
+                    ball_positions=np.array([b.pos.copy() for b in balls]),
+                    active_mask=np.array([b.active for b in balls], dtype=bool),
+                    indexed_mask=np.array([b.indexed for b in balls], dtype=bool),
+                    robot_pos=robot_pos.copy(),
+                    robot_theta=robot_theta,
+                    captured_count=indexed_count,
+                )
+            )
+
+    indexed_positions = np.array(
+        [
+            b.capture_pos.copy() if (b.indexed and b.capture_pos is not None) else b.pos.copy()
+            for b in balls
+        ],
+        dtype=float,
+    )
+
+    contacted_count = sum(1 for b in balls if b.state == BALL_STATE_CONTACTED)
+    controlled_count = sum(1 for b in balls if b.state == BALL_STATE_CONTROLLED)
+    free_count = sum(1 for b in balls if b.state == BALL_STATE_FREE)
+
+    return RunResult(
+        final_positions=np.array([b.pos.copy() for b in balls]),
+        active_mask=np.array([b.active for b in balls], dtype=bool),
+        indexed_mask=np.array([b.indexed for b in balls], dtype=bool),
+        indexed_positions=indexed_positions,
+        snapshots=snapshots,
+        captured_count=indexed_count,
+        path_name=path.name,
+        seed=seed,
+        total_time=total_time,
+        collision_samples=len(collision_trace),
+        bump_region_samples=len(bump_trace),
+        trench_region_samples=len(trench_trace),
+        first_intake_time=first_intake_time,
+        robot_trace=np.array(robot_trace, dtype=float) if robot_trace else np.empty((0, 2), dtype=float),
+        collision_trace=np.array(collision_trace, dtype=float) if collision_trace else np.empty((0, 2), dtype=float),
+        bump_trace=np.array(bump_trace, dtype=float) if bump_trace else np.empty((0, 2), dtype=float),
+        trench_trace=np.array(trench_trace, dtype=float) if trench_trace else np.empty((0, 2), dtype=float),
+        capture_trace=np.array(capture_trace, dtype=float) if capture_trace else np.empty((0, 2), dtype=float),
+        contact_trace=np.array(contact_trace, dtype=float) if contact_trace else np.empty((0, 2), dtype=float),
+        contacted_count=contacted_count,
+        controlled_count=controlled_count,
+        free_count=free_count,
+    )
+
+
+def default_paths() -> List[PathSpec]:
+    return [
+        PathSpec(
+            name="Straight center",
+            waypoints=[
+                PathWaypoint(-5.8, 0.0, 0.0),
+                PathWaypoint(-2.2, 0.0, 0.0),
+                PathWaypoint(0.8, 0.0, 0.0),
+                PathWaypoint(3.2, 0.0, 0.0),
+            ],
+        ),
+        PathSpec(
+            name="Upper sweep",
+            waypoints=[
+                PathWaypoint(-5.8, 0.85, -10.0),
+                PathWaypoint(-2.2, 0.62, -5.0),
+                PathWaypoint(0.8, 0.38, 3.0),
+                PathWaypoint(3.2, 0.15, 9.0),
+            ],
+        ),
+        PathSpec(
+            name="Lower sweep",
+            waypoints=[
+                PathWaypoint(-5.8, -0.85, 10.0),
+                PathWaypoint(-2.2, -0.62, 5.0),
+                PathWaypoint(0.8, -0.38, -3.0),
+                PathWaypoint(3.2, -0.15, -9.0),
+            ],
+        ),
+    ]
+
+
+
+def save_params_json(params: SimParams, out_path: Path) -> None:
+    out_path.write_text(json.dumps(params.to_dict(), indent=2))
+
+
+def save_numpy_dict(npz_path: Path, **arrays) -> None:
+    np.savez_compressed(npz_path, **arrays)
+
+
+def save_pathspec_json(path: PathSpec, out_path: Path) -> None:
+    out_path.write_text(json.dumps(path.to_serializable_dict(), indent=2))
+
+
+def save_pathplanner_path(path: PathSpec, out_path: str | Path) -> None:
+    save_pathplanner_file(path.to_serializable_dict(), out_path)
+
+
+def _pathspec_from_dict(data: Dict[str, Any]) -> PathSpec:
+    waypoints = [PathWaypoint(**wp) for wp in data["waypoints"]]
+    return PathSpec(
+        name=data["name"],
+        waypoints=waypoints,
+        max_velocity=data.get("max_velocity", 3.5),
+        max_acceleration=data.get("max_acceleration", 2.5),
+        use_spline=data.get("use_spline", True),
+        samples_per_seg=data.get("samples_per_seg", 28),
+        metadata=dict(data.get("metadata") or {}),
+    )
+
+
+def load_pathspec_json(path_file: str | Path) -> PathSpec:
+    raw_path = Path(path_file)
+    data = json.loads(raw_path.read_text())
+    if raw_path.suffix.lower() == ".path" or is_pathplanner_payload(data):
+        data = load_pathplanner_dict(data)
+    return _pathspec_from_dict(data)
