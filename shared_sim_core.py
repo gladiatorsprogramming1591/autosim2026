@@ -168,7 +168,7 @@ class SimParams:
     # Intake model
     intake_enabled: bool = True
     intake_depth: float = 0.20
-    intake_half_width: float = 0.30
+    intake_half_width: float = 0.32
     intake_capture_speed: float = 2.0
     intake_hold_offset: float = -.02
     max_intaked_balls: int = 40
@@ -206,7 +206,7 @@ class SimParams:
     depot_tangential_damping: float = 0.12
 
     # Bump region effects.
-    bump_surface_drag: float = 0.10
+    bump_surface_drag: float = 0.15
     bump_crest_drag: float = 0.0
     bump_roll_accel: float = 2.54
 
